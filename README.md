@@ -77,5 +77,27 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 血缘交接包
+
+变更评审交接时用 `backend/app/routers/lineage_handoff.py` 暴露的接口，
+业务逻辑在 `app/services/lineage_graph.py` 和 `app/services/metadata_diff.py`。
+
+- `POST /api/handoff/packages`：按库范围 + 事实表 + 待删字段生成可回放交接包。
+- `GET /api/handoff/packages/latest`：取最近一份交接包。
+- `GET /api/handoff/packages/{包编号}/download[.csv]`：下载交接材料。
+- `GET /api/handoff/packages/{包编号}/comparison`：变更对比视角，已确认关系与
+  仍需跨库确认的边界分开列出。
+- `GET /api/handoff/packages/{包编号}/replay`：按包内范围重放并核对是否漂移。
+- `POST /api/handoff/packages/{包编号}/interrupt`：登记一次中断（只给已剔除边界）。
+- `POST /api/handoff/field-deletions`：提交字段删除，返回影响清单并同步
+  `metadata_diff` 的复核清单。
+
+证据只有三态：`已确认`（范围内有字段级证据）、`无依赖`（范围内证据表明不重叠）、
+`证据欠缺`（对端在交接范围外，禁止下结论）。范围外的来源字段与转换语句一律以
+`已剔除（超出交接库范围）` 占位，只保留表级边界和来源库名。
+
+前端的交接面板在「血缘图谱」和「元数据变更对比」两个模块页顶部复用：
+`frontend/src/views/LineageHandoffPanel.vue`。
+
 领域：数据工程
 子方向：数仓与数据湖

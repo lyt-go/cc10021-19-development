@@ -28,6 +28,9 @@
       </span>
     </p>
 
+    <LineageHandoffPanel v-if="meta.key === 'lineage_graph'" />
+    <LineageHandoffPanel v-else-if="meta.key === 'metadata_diff'" />
+
     <form class="filter-bar" @submit.prevent="reload">
       <label v-for="field in filterFields" :key="field" class="filter-item">
         <span>{{ field }}</span>
@@ -104,6 +107,7 @@ import {
   runAction as applyAction,
 } from '@/api/backend-service'
 import type { EntryRow } from '@/data/types'
+import LineageHandoffPanel from '@/views/LineageHandoffPanel.vue'
 
 const props = defineProps<{ moduleKey: string }>()
 const meta = moduleMeta(props.moduleKey)

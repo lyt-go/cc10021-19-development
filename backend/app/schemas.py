@@ -29,3 +29,25 @@ class EntryPayload(BaseModel):
 class ActionPayload(BaseModel):
     action: str
     remark: str | None = None
+
+
+class HandoffPackageRequest(BaseModel):
+    databases: list[str] = Field(default_factory=list)
+    table: str
+    deleted_fields: list[str] = Field(default_factory=list)
+    package_id: str | None = None
+
+
+class HandoffInterruptRequest(BaseModel):
+    databases: list[str] = Field(default_factory=list)
+    table: str
+    deleted_fields: list[str] = Field(default_factory=list)
+    completed_steps: list[str] = Field(default_factory=list)
+    extracted_relations: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class FieldDeletionRequest(BaseModel):
+    table: str
+    deleted_fields: list[str] = Field(default_factory=list)
+    databases: list[str] = Field(default_factory=list)
+    package_id: str | None = None

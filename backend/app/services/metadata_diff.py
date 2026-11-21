@@ -12,7 +12,23 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.lineage_graph import (
+    EVIDENCE_CONFIRMED,
+    EVIDENCE_MISSING,
+    EVIDENCE_NONE,
+)
 from app.store import store
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _split_csv(value: Any) -> list[str]:
+    text = str(value or "").strip()
+    if not text or text == "*":
+        return []
+    return [item.strip() for item in text.replace("，", ",").split(",") if item.strip()]
 
 
 class MetadataDiffService(BaseModuleService):
@@ -106,15 +122,160 @@ class MetadataDiffService(BaseModuleService):
             return "低风险：新增字段不影响已有逻辑"
 
     def _validate_lineage_impact(self, table_name: str, deleted_fields: list[str]) -> None:
-        """校验血缘完整性：检测删除字段是否影响下游表依赖。"""
-        lineage_rows = store.rows("lineage_graph")
-        affected = [
-            r for r in lineage_rows
-            if r.get("上游表名") == table_name and r.get("status") == "已生效"
+        """校验血缘完整性：只对交接范围内有字段级证据的依赖标记待校验。
+
+        范围外的来源关系不能仅凭表名就升级为异常——那会把「没权限看」当成「确认断链」。
+        """
+        from app.services.lineage_graph import LineageGraphService
+
+        lineage_service = LineageGraphService()
+        package = lineage_service.latest_handoff_package(table_name)
+        if package is None:
+            # 没有交接包：范围外的字段明细不可见，不做确定判断，只保留变更记录。
+            return
+        if set(package.get("待删字段") or []) != set(deleted_fields):
+            # 交接包针对的是另一批删除字段，不能拿它的结论套用到本次变更。
+            return
+        confirmed_ids = {item["关系编号"] for item in package.get("删除影响", [])
+                         if item.get("结论") == EVIDENCE_CONFIRMED}
+        for lr in store.rows("lineage_graph"):
+            if lr.get("关系编号") in confirmed_ids:
+                lr["abnormal"] = True
+                lr["status"] = "待校验"
+
+    def compare_handoff_package(self, package: dict[str, Any] | None) -> dict[str, Any]:
+        """变更对比消费血缘交接包：分开「已确认关系」与「仍需跨库确认的边界」。
+
+        下载文件里的关系行会带上同一套分组，接收人打开即可对照，
+        不会把证据欠缺的边界当成已确认依赖，也不会把真无依赖误报成待办。
+        """
+        if not package:
+            return {
+                "包编号": None,
+                "已确认关系": [],
+                "仍需跨库确认": [],
+                "确认无依赖": [],
+                "字段清单": [],
+                "可处理对象": [],
+                "需补采边界": [],
+                "下载文件名": "",
+            }
+        confirmed = [view for view in package.get("关系中转", [])]
+        boundaries = [view for view in package.get("关系边界", [])]
+        no_dependency = [
+            item for item in package.get("删除影响", [])
+            if item.get("结论") == EVIDENCE_NONE
         ]
-        for lr in affected:
-            lr["abnormal"] = True
-            lr["status"] = "待校验"
+        approval = package.get("审批清单", {})
+        fields = sorted({
+            field
+            for view in confirmed
+            for key in ("来源字段", "目标字段")
+            for field in _split_csv(view.get(key))
+        })
+        return {
+            "包编号": package.get("包编号"),
+            "交接库范围": package.get("交接库范围", []),
+            "事实表": package.get("事实表"),
+            "已确认关系": [
+                {
+                    "关系编号": view.get("关系编号"),
+                    "上游表名": view.get("上游表名"),
+                    "下游表名": view.get("下游表名"),
+                    "来源字段": view.get("来源字段"),
+                    "目标字段": view.get("目标字段"),
+                    "转换逻辑": view.get("转换逻辑"),
+                    "证据状态": EVIDENCE_CONFIRMED,
+                }
+                for view in confirmed
+            ],
+            "仍需跨库确认": [
+                {
+                    "关系编号": view.get("关系编号"),
+                    "上游表名": view.get("上游表名"),
+                    "上游库名": view.get("上游库名"),
+                    "下游表名": view.get("下游表名"),
+                    "下游库名": view.get("下游库名"),
+                    "证据状态": EVIDENCE_MISSING,
+                    "边界说明": view.get("边界说明"),
+                    # 范围外字段与转换语句不出包，这里显式留空，避免界面误展示。
+                    "来源字段": "",
+                    "转换逻辑": "",
+                }
+                for view in boundaries
+            ],
+            "确认无依赖": [
+                {"关系编号": item.get("关系编号"), "对端表名": item.get("对端表名"),
+                 "结论": item.get("结论")}
+                for item in no_dependency
+            ],
+            "字段清单": fields,
+            "可处理对象": approval.get("可处理对象", []),
+            "需补采边界": approval.get("需补采边界", []),
+            "下载文件名": f"{package.get('包编号')}.json",
+        }
+
+    def submit_field_deletion(
+        self,
+        *,
+        table: str,
+        deleted_fields: list[str],
+        databases: list[str],
+        package_id: str | None = None,
+    ) -> dict[str, Any]:
+        """提交一次字段删除：先生成交接包，再同步复核清单，最后给出影响清单。
+
+        返回的影响清单里，「审批者可以处理的对象」只包含交接范围内有字段级证据的依赖，
+        「需要补采的边界」单列范围外来源，接收人不必在两条来源里猜哪条能拍板。
+        """
+        from app.services.lineage_graph import LineageGraphService
+
+        lineage_service = LineageGraphService()
+        package = lineage_service.build_handoff_package(
+            databases=databases,
+            table=table,
+            deleted_fields=deleted_fields,
+            package_id=package_id,
+        )
+        synced = lineage_service.sync_handoff_to_checklist(package)
+
+        # 变更记录本身也落一条，保证删除动作在变更对比列表里可见。
+        batch = package.get("包编号") or ""
+        diff_rows = store.rows(self.MODULE)
+        new_id = max((int(r.get("id", 0)) for r in diff_rows), default=0) + 1
+        record = {
+            "id": new_id,
+            "变更编号": f"META-{new_id:04d}",
+            "变更对象": f"{table}.{'、'.join(deleted_fields)}",
+            "变更类型": "删除",
+            "旧值": f"字段在表 {table} 中",
+            "新值": "N/A",
+            "变更批次": batch,
+            "影响评估": (
+                f"高风险：可确认依赖{len(package.get('审批清单', {}).get('可处理对象', []))}条，"
+                f"待跨库确认{len(package.get('审批清单', {}).get('需补采边界', []))}条"
+            ),
+            "变更时间": _now(),
+            "交接包编号": batch,
+            "status": "待审核",
+            "pending": True,
+            "abnormal": bool(package.get("审批清单", {}).get("需补采边界")),
+        }
+        diff_rows.append(record)
+
+        comparison = self.compare_handoff_package(package)
+        return {
+            "变更编号": record["变更编号"],
+            "包编号": batch,
+            "生成时间": package.get("生成时间"),
+            "是否续做": package.get("是否续做"),
+            "影响清单": comparison["可处理对象"],
+            "需补采的边界": comparison["需补采边界"],
+            "确认无依赖": comparison["确认无依赖"],
+            "同步复核清单条数": synced,
+            "交接包问题": package.get("问题清单", []),
+            "下载文件名": comparison["下载文件名"],
+        }
 
     def domain_snapshot(self) -> dict[str, Any]:
         snapshot = super().domain_snapshot()
